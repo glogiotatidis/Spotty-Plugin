@@ -21,6 +21,8 @@ use constant SEEK_THRESHOLD => 3;
 use constant VOLUME_GRACE_PERIOD => 20;
 use constant PRE_BUFFER_TIME => 7;
 use constant PRE_BUFFER_SIZE_THRESHOLD => 10 * 1024 * 1024;
+use constant PLAYBACK_RECOVERY_DELAY => 3;
+use constant PLAYBACK_MONITOR_INTERVAL => 30;
 
 my $cache = Slim::Utils::Cache->new();
 my $prefs = preferences('plugin.spotty');
@@ -481,6 +483,9 @@ sub _connectEvent {
 						}
 					}
 				);
+				
+				# Set up periodic monitoring for silent failures (issue #82)
+				_startPlaybackMonitor($client);
 
 				# sync volume up to spotify if we just got connected
 				if ( !$client->pluginData('SpotifyConnect') ) {
@@ -516,6 +521,9 @@ sub _connectEvent {
 				my $request = Slim::Control::Request->new( $client->id, ['pause', 1] );
 				$request->source(__PACKAGE__);
 				$request->execute();
+				
+				# Stop playback monitor when pausing
+				Slim::Utils::Timers::killTimers($client, \&_checkPlaybackHealth);
 			}
 			elsif ( $client->isPlaying && !$client->isStopped() && !$client->isPaused() && ($result->{device}->{id} ne Plugins::Spotty::Connect::DaemonManager->idFromMac($clientId) && $result->{device}->{name} ne $client->name) && __PACKAGE__->isSpotifyConnect($client) ) {
 				main::INFOLOG && $log->is_info && $log->info("Spotify told us to pause, but current player is no longer the Connect target");
@@ -523,6 +531,9 @@ sub _connectEvent {
 				my $request = Slim::Control::Request->new( $client->id, ['pause', 1] );
 				$request->source(__PACKAGE__);
 				$request->execute();
+				
+				# Stop playback monitor when pausing
+				Slim::Utils::Timers::killTimers($client, \&_checkPlaybackHealth);
 
 				# reset Connect status on this device
 				$client->playingSong()->pluginData( context => 0 );
@@ -607,6 +618,99 @@ sub cacheFolder {
 	}
 
 	return $cacheFolder
+}
+
+sub _startPlaybackMonitor {
+	my ($client) = @_;
+	
+	# Kill any existing monitor timer
+	Slim::Utils::Timers::killTimers($client, \&_checkPlaybackHealth);
+	
+	# Store initial playback state
+	$client->pluginData(lastPlaybackCheck => {
+		time => time(),
+		playing => $client->isPlaying(),
+		songTime => $client->songTime() || 0,
+		bytesReceived => $client->playingSong() ? $client->playingSong()->bytesReceived() : 0,
+	});
+	
+	# Schedule periodic checks
+	Slim::Utils::Timers::setTimer(
+		$client,
+		Time::HiRes::time() + PLAYBACK_MONITOR_INTERVAL,
+		\&_checkPlaybackHealth
+	);
+}
+
+sub _checkPlaybackHealth {
+	my ($client) = @_;
+	
+	# Only monitor if we're in Spotify Connect mode
+	return unless __PACKAGE__->isSpotifyConnect($client);
+	
+	my $song = $client->playingSong();
+	return unless $song && $song->streamUrl() =~ /spotify:\/\/connect-/;
+	
+	my $lastCheck = $client->pluginData('lastPlaybackCheck') || {};
+	my $currentTime = time();
+	my $currentSongTime = $client->songTime() || 0;
+	my $currentBytes = $song->bytesReceived() || 0;
+	
+	# Check if we're supposedly playing but nothing is happening
+	if ($client->isPlaying() && !$client->isPaused()) {
+		my $timeDelta = $currentTime - ($lastCheck->{time} || $currentTime);
+		my $songTimeDelta = $currentSongTime - ($lastCheck->{songTime} || 0);
+		my $bytesDelta = $currentBytes - ($lastCheck->{bytesReceived} || 0);
+		
+		# If time has passed but song position and bytes haven't changed, we're stuck
+		if ($timeDelta > 10 && $songTimeDelta < 1 && $bytesDelta < 1000) {
+			$log->warn("Playback appears stuck - no progress in ${timeDelta}s");
+			
+			# Try to recover by refreshing the player state
+			if (my $api = __PACKAGE__->getAPIHandler($client)) {
+				$api->player(sub {
+					my ($state) = @_;
+					if (!$state || !$state->{is_playing}) {
+						$log->warn("Spotify reports not playing - attempting recovery");
+						
+						# Clear token cache
+						my $username = $api->username || 'generic';
+						my $cacheKey = "spotty_access_token_" . $prefs->get('iconCode') . Slim::Utils::Unicode::utf8toLatin1Transliterate($username);
+						$cache->remove($cacheKey);
+						$cache->remove("${cacheKey}_error_time");
+						
+						# Try to resume playback
+						Slim::Utils::Timers::setTimer(
+							$client,
+							Time::HiRes::time() + PLAYBACK_RECOVERY_DELAY,
+							sub {
+								my $request = Slim::Control::Request->new($client->id, ['play']);
+								$request->source(__PACKAGE__);
+								$request->execute();
+							}
+						);
+					}
+				});
+			}
+		}
+	}
+	
+	# Update last check state
+	$client->pluginData(lastPlaybackCheck => {
+		time => $currentTime,
+		playing => $client->isPlaying(),
+		songTime => $currentSongTime,
+		bytesReceived => $currentBytes,
+	});
+	
+	# Schedule next check
+	if (__PACKAGE__->isSpotifyConnect($client)) {
+		Slim::Utils::Timers::setTimer(
+			$client,
+			Time::HiRes::time() + PLAYBACK_MONITOR_INTERVAL,
+			\&_checkPlaybackHealth
+		);
+	}
 }
 
 sub shutdown {
