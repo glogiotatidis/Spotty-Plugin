@@ -695,6 +695,37 @@ sub _checkPlaybackHealth {
 		}
 	}
 	
+	# Also check if the Connect device is still available
+	if ($client->isPlaying() || ($currentTime - ($lastCheck->{time} || 0) > 60)) {
+		if (my $api = __PACKAGE__->getAPIHandler($client)) {
+			# Check device availability periodically
+			$api->devices(sub {
+				my ($devices) = @_;
+				if ($devices && ref $devices && $devices->{devices}) {
+					my $ourDevice = Plugins::Spotty::Connect::DaemonManager->idFromMac($client->id);
+					my $isActive = 0;
+					
+					foreach my $device (@{$devices->{devices}}) {
+						if ($device->{id} eq $ourDevice && $device->{is_active}) {
+							$isActive = 1;
+							last;
+						}
+					}
+					
+					# If we're playing but not active on Spotify, the controller has disconnected
+					if ($client->isPlaying() && !$isActive && __PACKAGE__->isSpotifyConnect($client)) {
+						$log->warn("Spotify Connect controller appears to have disconnected");
+						
+						# Transfer playback to our device to keep playing
+						$api->playerTransfer(sub {
+							$log->info("Transferred playback to local device after controller disconnect");
+						}, $client->id, 1); # play = 1 to continue playing
+					}
+				}
+			});
+		}
+	}
+	
 	# Update last check state
 	$client->pluginData(lastPlaybackCheck => {
 		time => $currentTime,
