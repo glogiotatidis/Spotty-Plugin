@@ -187,6 +187,7 @@ sub _gotTokenInfo {
 		$log->error($response->{error} || "Failed to get Spotify access token");
 		# store special value to prevent hammering the backend
 		$cache->set($cacheKey, $token = -1, 15);
+		$cache->set("${cacheKey}_error_time", time(), 15);
 	}
 
 	return $token;
@@ -219,8 +220,24 @@ sub get {
 	$args ||= {};
 
 	if (my $token = $cache->get(_getCacheKey($args->{code}, $args->{accountId} || ($api && $api->username) || (main::SCANNER ? '_scanner' : 'generic')))) {
-		main::DEBUGLOG && $log->is_debug && $log->debug("Found cached token: $token");
-		return $cb ? $cb->($token) : $token;
+		# Check if token is the error marker
+		if ($token == -1) {
+			# Check if we should retry after the error cache period
+			my $cacheKey = _getCacheKey($args->{code}, $args->{accountId} || ($api && $api->username) || (main::SCANNER ? '_scanner' : 'generic'));
+			my $errorTime = $cache->get("${cacheKey}_error_time") || 0;
+			
+			if (time() - $errorTime > 15) {
+				main::DEBUGLOG && $log->is_debug && $log->debug("Error token cache expired, clearing and retrying");
+				$cache->remove($cacheKey);
+				$cache->remove("${cacheKey}_error_time");
+			} else {
+				main::DEBUGLOG && $log->is_debug && $log->debug("Found cached error token. Skipping refresh attempt.");
+				return $cb ? $cb->() : undef;
+			}
+		} else {
+			main::DEBUGLOG && $log->is_debug && $log->debug("Found cached token: $token");
+			return $cb ? $cb->($token) : $token;
+		}
 	}
 	else {
 		main::DEBUGLOG && $log->is_debug && $log->debug("Didn't find cached token. Need to refresh.");

@@ -12,6 +12,7 @@ use Slim::Utils::Log;
 use Slim::Utils::Cache;
 use Slim::Utils::Prefs;
 use Slim::Utils::Timers;
+use Slim::Utils::Unicode;
 
 use Plugins::Spotty::API qw(uri2url);
 
@@ -403,6 +404,19 @@ sub _connectEvent {
 	$spotty->player(sub {
 		my ($result) = @_;
 
+		# If we didn't get a result, it might be due to token issues
+		if (!$result && $cmd eq 'start') {
+			$log->warn("No result from Spotify API - possible token issue, will retry");
+			# Clear the error token cache to force a retry
+			if (my $api = __PACKAGE__->getAPIHandler($client)) {
+				my $username = $api->username || 'generic';
+				my $cacheKey = "spotty_access_token_" . $prefs->get('iconCode') . Slim::Utils::Unicode::utf8toLatin1Transliterate($username);
+				$cache->remove($cacheKey);
+				$cache->remove("${cacheKey}_error_time");
+			}
+			return;
+		}
+
 		my $song = $client->playingSong();
 		my $streamUrl = ($song ? $song->streamUrl : '') || '';
 		$streamUrl =~ s/\/\///;
@@ -445,6 +459,28 @@ sub _connectEvent {
 
 				my $request = $client->execute( [ 'playlist', 'play', sprintf("spotify://connect-%u", Time::HiRes::time() * 1000) ] );
 				$request->source(__PACKAGE__);
+				
+				# Set up a watchdog to detect premature stream termination
+				Slim::Utils::Timers::setTimer(
+					$client,
+					Time::HiRes::time() + 2,
+					sub {
+						my $client = shift;
+						if ($client->playingSong() && $client->playingSong()->streamUrl() =~ /spotify:\/\/connect-/) {
+							my $bytesReceived = $client->playingSong()->bytesReceived() || 0;
+							if ($bytesReceived < 50000 && !$client->isPlaying()) {
+								$log->warn("Stream terminated prematurely (only $bytesReceived bytes) - likely token issue");
+								# Clear token cache to force refresh
+								if (my $api = __PACKAGE__->getAPIHandler($client)) {
+									my $username = $api->username || 'generic';
+									my $cacheKey = "spotty_access_token_" . $prefs->get('iconCode') . Slim::Utils::Unicode::utf8toLatin1Transliterate($username);
+									$cache->remove($cacheKey);
+									$cache->remove("${cacheKey}_error_time");
+								}
+							}
+						}
+					}
+				);
 
 				# sync volume up to spotify if we just got connected
 				if ( !$client->pluginData('SpotifyConnect') ) {

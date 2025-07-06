@@ -7,6 +7,8 @@ use Scalar::Util qw(blessed);
 use Slim::Utils::Log;
 use Slim::Utils::Prefs;
 use Slim::Utils::Timers;
+use Slim::Utils::Cache;
+use Slim::Utils::Unicode;
 
 use Plugins::Spotty::Plugin;
 use Plugins::Spotty::Connect::Daemon;
@@ -207,8 +209,33 @@ sub checkAPIConnectPlayers {
 			my $spotifyId = $connectDevices{$helper->name};
 
 			if ( !$oneHelper && !$spotifyId && $helper->cache eq $cacheFolder ) {
-				$log->warn("Connect daemon is running, but not connected - shutting down to force restart: " . $helper->mac . " " . $helper->name);
-				$class->stopHelper($helper->mac);
+				# Check if auto-restart is disabled
+				if ( $prefs->get('disableAutoRestart') ) {
+					main::INFOLOG && $log->is_info && $log->info("Connect daemon not connected but auto-restart is disabled: " . $helper->mac);
+					next;
+				}
+
+				# Give the daemon more time before declaring it dead
+				if ( $helper->uptime() > 30 ) {  # Only restart if daemon has been running for at least 30 seconds
+					$log->warn("Connect daemon is running, but not connected - shutting down to force restart: " . $helper->mac . " " . $helper->name);
+					
+					# Clear token cache in case it's a token issue
+					if (my $client = Slim::Player::Client::getClient($helper->mac)) {
+						if (my $api = Plugins::Spotty::Plugin->getAPIHandler($client)) {
+							my $username = $api->username || 'generic';
+							my $cacheKey = "spotty_access_token_" . $prefs->get('iconCode') . Slim::Utils::Unicode::utf8toLatin1Transliterate($username);
+							my $cache = Slim::Utils::Cache->new();
+							$cache->remove($cacheKey);
+							$cache->remove("${cacheKey}_error_time");
+							$log->info("Cleared token cache for " . $helper->mac);
+						}
+					}
+					
+					$class->stopHelper($helper->mac);
+				}
+				else {
+					main::INFOLOG && $log->is_info && $log->info("Connect daemon just started, giving it more time to connect: " . $helper->mac);
+				}
 
 				# flag this system as flaky if we have to restart and the user is relying on the server
 				# $prefs->set('checkDaemonConnected', 1) if $prefs->get('disableDiscovery');
